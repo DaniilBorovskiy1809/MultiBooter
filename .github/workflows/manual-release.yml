@@ -1,0 +1,145 @@
+name: Manual release
+
+# Manual builds only. This workflow never runs on push or pull_request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      ANDROID_API: "36"
+      NDK_VERSION: "30.0.16248370"
+      BUILD_TOOLS_VERSION: "36.0.0"
+      VENTOY_VERSION: "1.1.17"
+      VENTOY_COMMIT: "7cbdc5cf69935bcf1f085ae67f40e70ea7e74bae"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}"
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools faketime mtools
+
+      - name: Fetch pinned Ventoy source
+        run: |
+          VENTOY_SRC="$RUNNER_TEMP/ventoy"
+          git init "$VENTOY_SRC"
+          git -C "$VENTOY_SRC" remote add origin https://github.com/ventoy/Ventoy.git
+          git -C "$VENTOY_SRC" fetch --depth 1 origin "$VENTOY_COMMIT"
+          git -C "$VENTOY_SRC" checkout FETCH_HEAD
+          test "$(git -C "$VENTOY_SRC" rev-parse HEAD)" = "$VENTOY_COMMIT"
+          echo "VENTOY_SRC=$VENTOY_SRC" >> "$GITHUB_ENV"
+
+      - name: Restore pinned Secure Boot EFI files
+        run: |
+          EFI_DIR="$VENTOY_SRC/INSTALL/EFI/BOOT"
+          IMAGE="src/main/assets/ventoy.disk.img"
+
+          mkdir -p "$EFI_DIR"
+
+          rm -f \
+            "$EFI_DIR/BOOTX64.EFI" \
+            "$EFI_DIR/mmx64.efi" \
+            "$EFI_DIR/fbx64.efi" \
+            "$EFI_DIR/grubx64_real.efi"
+
+          mcopy -i "$IMAGE" ::/EFI/BOOT/BOOTX64.EFI "$EFI_DIR/BOOTX64.EFI"
+          mcopy -i "$IMAGE" ::/EFI/BOOT/mmx64.efi "$EFI_DIR/mmx64.efi"
+          mcopy -i "$IMAGE" ::/EFI/BOOT/fbx64.efi "$EFI_DIR/fbx64.efi"
+          mcopy -i "$IMAGE" ::/EFI/BOOT/grubx64_real.efi "$EFI_DIR/grubx64_real.efi"
+
+          echo "1ff3f223c2fcf5b11615d042fcb5674c4651bbbc8505b5b2987d60da0cb65d1a  $EFI_DIR/BOOTX64.EFI" | sha256sum -c -
+          echo "1a3687f923d077080fe49feb470e3932c2b1d3fd4c6439123aa0226246a24522  $EFI_DIR/mmx64.efi" | sha256sum -c -
+          echo "c8fc4661f4b64b916e37e4fdd68042d3d64290a696add9199afb84c12ad896c8  $EFI_DIR/fbx64.efi" | sha256sum -c -
+          echo "907c99a8370e953eb4ec34df2c314cf979356bfca97733ccb1139ee3f5e98cce  $EFI_DIR/grubx64_real.efi" | sha256sum -c -
+
+      - name: Build APK
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MULTIBOOTER_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MULTIBOOTER_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MULTIBOOTER_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MULTIBOOTER_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || {
+            echo "MULTIBOOTER_KEYSTORE_BASE64 is not configured." >&2
+            exit 1
+          }
+          test -n "$KEYSTORE_PASSWORD" || {
+            echo "MULTIBOOTER_KEYSTORE_PASSWORD is not configured." >&2
+            exit 1
+          }
+          test -n "$KEY_ALIAS" || {
+            echo "MULTIBOOTER_KEY_ALIAS is not configured." >&2
+            exit 1
+          }
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/multibooter.jks"
+
+          VERSION="$(
+            grep -o 'android:versionName="[^"]*"' AndroidManifest.xml |
+            head -n 1 |
+            cut -d'"' -f2
+          )"
+          TAG="${VERSION}-manual.${GITHUB_RUN_NUMBER}"
+          APK="MultiBooter-${TAG}.apk"
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner" sign \
+            --ks "$RUNNER_TEMP/multibooter.jks" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" \
+            --out "$APK" \
+            app-release-unsigned.apk
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner" verify \
+            --print-certs \
+            "$APK"
+
+          sha256sum "$APK" > "$APK.sha256"
+
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          gh release create "$TAG" "$APK" "$APK.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "MultiBooter $TAG" \
+            --notes "Manual workflow_dispatch build of $GITHUB_SHA." \
+            --prerelease
